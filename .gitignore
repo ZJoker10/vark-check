@@ -1,0 +1,25 @@
+# Secrets
+.env
+
+# Generated data (rebuild with: python scripts/ingest.py)
+data/index/
+data/*.db
+data/*.db-wal
+data/*.db-shm
+
+# Runtime logs
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,11 @@
+# The agent core (retrieval, guardrails, orchestrator, SQLite memory) uses the
+# Python standard library ONLY. Streamlit is the single required dependency.
+streamlit>=1.36
+
+# --- Optional upgrades (the code detects these and degrades gracefully) ---
+# Better embeddings than the built-in hashing TF-IDF retriever:
+# sentence-transformers>=2.7
+# PDF ingestion (data/course/*.pdf). Markdown and .txt work out of the box:
+# pypdf>=4.2
+# Offline text-to-speech for the "A" (aural) format:
+# pyttsx3>=2.90
