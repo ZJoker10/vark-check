@@ -1,4 +1,4 @@
-.PHONY: setup run test lint ingest seed demo clean
+.PHONY: setup run web test lint ingest seed demo clean
 
 PY ?= python3
 
@@ -7,6 +7,9 @@ setup:  ## install dependencies
 
 run:  ## start the Streamlit app
 	$(PY) -m streamlit run app.py
+
+web:  ## start the v2 local web app (upload -> quiz -> report)
+	$(PY) -m varkcheck.web --port 8765
 
 test:  ## run the test suite (no network, no API key)
 	$(PY) -m pytest -q

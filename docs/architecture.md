@@ -185,3 +185,147 @@ simple vector store" without a dependency that can fail the night before a demo.
 
 ≈ 2¢ per student-topic, ≈ 6¢ per student for three topics. The full arithmetic
 is in the README.
+
+---
+
+# v2 — the local app (`python -m varkcheck.web`)
+
+v1 keeps the material fixed and varies the format. v2 does the opposite: the
+material is whatever the user uploads, and the profile picks the shape. The
+architecture is deliberately similar — deterministic Python around model calls —
+because the same argument applies: anything that must be *true* about the report
+is checked in code, not requested in the prompt.
+
+## Request path
+
+```mermaid
+flowchart LR
+  Browser["Browser<br/>index.html + app.js"] -->|multipart upload| Extract["/api/extract"]
+  Extract --> Uploads["uploads.py<br/>PDF · DOCX · MD · TXT · images"]
+  Uploads --> Session["SessionStore<br/>in memory, 2 h TTL, max 8"]
+  Browser -->|eight answers| Score["/api/score"]
+  Score --> Profile["profile.py<br/>arithmetic, no model call"]
+  Browser -->|upload id + profile + style| Report["/api/report"]
+  Report --> Summarize["summarize.py<br/>map per part → compose → gate → retry"]
+  Summarize --> LLM["ChatClient<br/>Ollama · DeepSeek · OpenAI"]
+  Summarize --> Render["render.py<br/>HTML preview"]
+  Render --> Browser
+  Browser -->|rendered SVG per diagram| Export["/api/export"]
+  Export --> Files["PDF · DOCX · MD"]
+
+  classDef Primary fill:#00ffff,color:#000,stroke:#080d1a
+  classDef Gateway fill:#ee82ff,color:#fff,stroke:#080d1a
+  classDef DataLayer fill:#ff1493,color:#fff,stroke:#080d1a
+  classDef External fill:#444,color:#ccc,stroke:#666
+  class Uploads,Summarize,Render,Profile Primary
+  class Extract,Score,Report,Export Gateway
+  class Session,Files DataLayer
+  class LLM External
+```
+
+*(legend: cyan = deterministic Python, purple = HTTP endpoint, pink = state and
+generated files, grey = the one external service.)*
+
+## Why the report is built on the server
+
+A `file://` page cannot keep an API key off the client, cannot assemble a PDF,
+and cannot reach a local model without CORS. The server is stdlib
+`ThreadingHTTPServer`; v2 adds no web framework. Uploads live in RAM, keyed by a
+random token, and are deleted with the session directory — there is no database
+anywhere in v2.
+
+## The report pipeline
+
+Two passes. The first is a **map** over the material, one model call per part;
+the second is a **reduce** that turns the part summaries into one document. This
+is what makes coverage structural: a call that never received a lecture cannot
+summarise it, and the composing call receives every part's sections.
+
+```mermaid
+flowchart TD
+  Doc["uploads.Document<br/>sections, sources, figures"] --> Parts["part_coverage()<br/>group sections into parts"]
+  Parts --> Loop{"for each part"}
+
+  Loop --> Fit["_fit_passages()<br/>budget 7k chars, strided"]
+  Fit --> PartPrompt["build_part_prompt()<br/>one part + whole outline + style"]
+  PartPrompt --> PartModel["map call<br/>json_mode, 2.2k tokens"]
+  PartModel --> PartNorm["_normalise()<br/>2–4 sections + terms, cited"]
+  PartNorm --> Thin{"section under<br/>35 words?"}
+  Thin -->|yes, once| PartPrompt
+  Thin -->|"no, or unrecoverable"| Fallback["_extractive_sections()<br/>quoted opening, still covered"]
+  Thin -->|no| Bag
+  Fallback --> Bag["sections + terms"]
+
+  Bag --> Compose["build_compose_prompt()<br/>every part's sections"]
+  Compose --> ComposeModel["reduce call<br/>json_mode, 4k tokens"]
+  ComposeModel --> Assemble["_assemble()<br/>shape + citation grounding"]
+  Assemble --> Copy["synthesis.check()<br/>6-word shingles"]
+  Assemble --> Gate["_quality_issues()<br/>200–480 words · meta-prose · coverage · diagram"]
+  Copy --> Verdict{"pass?"}
+  Gate --> Verdict
+  Verdict -->|no, first time| Retry["retry with the exact failures quoted"]
+  Retry --> ComposeModel
+  Verdict -->|yes| Final["_finalise()<br/>guarantee a visual for V"]
+  Verdict -->|no, second time| Honest["ship the better draft,<br/>warnings on the page"]
+  Final --> Out["Report"]
+  Honest --> Out
+
+  classDef Primary fill:#00ffff,color:#000,stroke:#080d1a
+  classDef Gateway fill:#ee82ff,color:#fff,stroke:#080d1a
+  classDef DataLayer fill:#ff1493,color:#fff,stroke:#080d1a
+  classDef External fill:#444,color:#ccc,stroke:#666
+  class Doc,Parts,Fit,PartNorm,Assemble,Copy,Gate,Fallback,Final Primary
+  class PartPrompt,Compose,PartModel,ComposeModel,Loop,Thin,Verdict,Retry,Honest Gateway
+  class Out,Bag DataLayer
+```
+
+*(legend: cyan = deterministic Python, purple = control flow and model-facing
+prompts, pink = data carried between passes, grey = the external service.)*
+
+The part pass is deliberately modest: 2–4 sections per part, 90–160 words each,
+plus up to three key terms. Asking a small model for a whole report's worth of
+prose in one reply is how the opening lecture gets summarised and the rest is
+lost; asking it for one lecture at a time is a task an 8B model can finish. The
+composing pass then does only what needs the whole document in view: title,
+200–480-word overview, diagrams, comparison table, self-checks, study plan.
+
+Each check answers a different question, and none of them can be satisfied by
+prompt wording alone:
+
+| Check | Question | Failure mode it prevents |
+|---|---|---|
+| `synthesis.check` | are these sentences the source's sentences? | a report that is an excerpt with new headings |
+| `part_coverage` / per-part calls | was every part actually read? | three sections about the first lecture, silence on the rest |
+| `_missing_parts` | does the overview name every part? | a summary that is about one chapter |
+| `_quality_issues` | is this a summary, of the subject, in the right shape? | thin overviews, "This report covers…", a visual report with no visual |
+| `_normalise` citations | is each `source:` a passage we actually sent? | invented `file §section` references |
+
+Two failures in a row do not become an error page: the report ships and the page
+states what is wrong with it. A wrong report that admits it is recoverable; a
+missing report is not.
+
+## When a part cannot be summarised
+
+The per-part pass retries once with the thin section names quoted back at it. If
+it still returns nothing usable, the part is carried into the report as a
+**quoted opening** (`_extractive_sections`) and the page says so. That is a
+deliberate ordering of failures: quoting breaks the copy rule, dropping the part
+breaks the coverage promise, and the student can see a quotation but cannot see
+what is absent. The same reasoning drives the "better of two drafts" rule in the
+composing pass.
+
+## Style is structure, not colour
+
+`_assemble()` enforces the shape: **A** drops every diagram and table, **R**
+drops diagrams, **K** keeps at most one. A visual report that the model failed to
+illustrate is given a hierarchy chart built from the document's own headings
+(`fallback_diagram`), captioned as such.
+
+## Diagram rendering without Node
+
+Mermaid is vendored (`static/mermaid.min.js`, 10.9.1). The report arrives in a
+`srcdoc` iframe with `sandbox="allow-same-origin"` — the report itself runs no
+scripts. The **parent** page initialises Mermaid and renders over the iframe's
+DOM, collects the SVG per diagram, and posts them back with the export request.
+PDF embeds them as vector images; DOCX rasterises them with `cairosvg`; Markdown
+keeps the Mermaid source, which is the useful form in a repository.
