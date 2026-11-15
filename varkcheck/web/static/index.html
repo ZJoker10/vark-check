@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VARK Check — your material, summarised the way you learn</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap top-inner">
+    <div class="brand">
+      <span class="mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8">
+          <path d="M4 5h7v14H4zM13 3l6 2-4 14-6-2z"/>
+        </svg>
+      </span>
+      <span class="name">VARK Check</span>
+      <span class="ver">v2</span>
+    </div>
+    <p class="tagline">Your material, summarised the way you learn.</p>
+    <div class="model" id="model-badge" title="The model that writes your report">checking model…</div>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <!-- ---------------------------------------------------------------- step 1 -->
+  <section class="step" id="step-upload">
+    <div class="step-rail"><span class="num">1</span></div>
+    <div class="step-body">
+      <h1>What are you studying?</h1>
+      <p class="lede">Drop in lecture notes, a chapter, slides, pasted text, or a few images.
+        PDF, DOCX, Markdown, plain text and pictures all work.</p>
+
+      <div class="drop" id="drop" tabindex="0" role="button" aria-label="Choose files to upload">
+        <input type="file" id="file-input" multiple
+               accept=".pdf,.docx,.md,.markdown,.txt,.png,.jpg,.jpeg,.webp,.gif" hidden>
+        <p class="drop-main"><strong>Drop files here</strong> or <span class="link">browse</span></p>
+        <p class="drop-sub">Up to 20 files, 25 MB each. Nothing leaves this computer.</p>
+        <ul class="file-list" id="file-list"></ul>
+      </div>
+
+      <details class="paste">
+        <summary>…or paste the text instead</summary>
+        <textarea id="notes" rows="7" placeholder="Paste lecture notes, a transcript, a chapter…"></textarea>
+      </details>
+
+      <div class="row">
+        <button class="primary" id="read-btn" disabled>Read the material</button>
+        <span class="status" id="upload-status" role="status" aria-live="polite"></span>
+      </div>
+
+      <div class="summary-card hidden" id="upload-result"></div>
+    </div>
+  </section>
+
+  <!-- ---------------------------------------------------------------- step 2 -->
+  <section class="step locked" id="step-quiz">
+    <div class="step-rail"><span class="num">2</span></div>
+    <div class="step-body">
+      <h2>How do you learn best?</h2>
+
+      <div id="quiz-saved" class="hidden">
+        <div class="profile-card" id="profile-card"></div>
+        <div class="row">
+          <button class="ghost" id="retake-btn">Retake the quiz</button>
+          <span class="status">Saved in this browser only. We never see it on a server.</span>
+        </div>
+      </div>
+
+      <div id="quiz-form">
+        <p class="lede">Eight statements, one answer each. This is a starting hypothesis, not a
+          diagnosis — the report is shaped by it, not limited by it.</p>
+        <form id="quiz">
+          <div class="quiz-head" aria-hidden="true">
+            <span></span><span>Not like me</span><span></span><span></span><span></span><span>Very like me</span>
+          </div>
+          <div id="quiz-items"></div>
+        </form>
+        <div class="row">
+          <button class="primary" id="save-profile" disabled>Save my profile</button>
+          <span class="status" id="quiz-status" role="status" aria-live="polite"></span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ---------------------------------------------------------------- step 3 -->
+  <section class="step locked" id="step-report">
+    <div class="step-rail"><span class="num">3</span></div>
+    <div class="step-body">
+      <h2>Build the report</h2>
+      <p class="lede">Same material, four different documents. Pick the shape you want; each one
+        restructures the content, not just the colours.</p>
+
+      <div class="styles" id="styles">
+        <button class="style-card" data-style="V" type="button">
+          <span class="swatch" data-accent="V"></span>
+          <span class="style-name">Visual</span>
+          <span class="style-desc">Diagrams, maps and tables; short prose that explains them.</span>
+          <span class="match hidden">matches your profile</span>
+        </button>
+        <button class="style-card" data-style="A" type="button">
+          <span class="swatch" data-accent="A"></span>
+          <span class="style-name">Aural</span>
+          <span class="style-desc">Spoken-style explanation and dialogue you can read aloud.</span>
+          <span class="match hidden">matches your profile</span>
+        </button>
+        <button class="style-card" data-style="R" type="button">
+          <span class="swatch" data-accent="R"></span>
+          <span class="style-name">Read / write</span>
+          <span class="style-desc">Numbered, dense, definition-first, with a glossary.</span>
+          <span class="match hidden">matches your profile</span>
+        </button>
+        <button class="style-card" data-style="K" type="button">
+          <span class="swatch" data-accent="K"></span>
+          <span class="style-name">Kinesthetic</span>
+          <span class="style-desc">Numbered steps, self-checks, theory only when a step needs it.</span>
+          <span class="match hidden">matches your profile</span>
+        </button>
+      </div>
+
+      <div class="row generate-row">
+        <button class="primary" id="generate-btn" disabled>Generate report</button>
+        <span class="status" id="generate-status" role="status" aria-live="polite"></span>
+      </div>
+
+      <div id="report-meta" class="report-meta hidden"></div>
+      <div id="report-warnings" class="warnings hidden"></div>
+
+      <div class="preview-frame hidden" id="preview-frame">
+        <div class="preview-bar">
+          <span class="preview-label">Preview</span>
+          <div class="segmented" id="format-picker" role="group" aria-label="Download format">
+            <button data-format="pdf" class="on" type="button">PDF</button>
+            <button data-format="docx" type="button">DOCX</button>
+            <button data-format="md" type="button">Markdown</button>
+          </div>
+          <button class="primary" id="download-btn">Download</button>
+        </div>
+        <iframe id="preview" title="Report preview" sandbox="allow-same-origin"></iframe>
+      </div>
+    </div>
+  </section>
+
+  <!-- ---------------------------------------------------------------- notes -->
+  <section class="about">
+    <details>
+      <summary>How this works, and what it does not do</summary>
+      <div class="about-grid">
+        <div>
+          <h3>It summarises, it does not excerpt</h3>
+          <p>Every sentence is rewritten and merged across sections, then checked in code against
+            your material: if too much of the report is close to verbatim source wording, it is sent
+            back once and rewritten. Each claim carries the source it came from.</p>
+        </div>
+        <div>
+          <h3>The profile is a hypothesis</h3>
+          <p>Matching teaching to a preferred learning style has weak evidence behind it
+            (Pashler et al., 2008). The report is shaped by how you described yourself because that
+            is a reasonable place to start — not because you have been diagnosed.</p>
+        </div>
+        <div>
+          <h3>Nothing is stored about you</h3>
+          <p>No account, no cookie, no analytics. Your answers stay in this browser's local storage.
+            The uploaded text lives in the server process's memory and expires after two hours.</p>
+        </div>
+        <div>
+          <h3>Images are embedded, not read</h3>
+          <p>Pictures in your material are placed in the report as figures with their captions. Their
+            contents are not interpreted, because there is no vision model in this build. Scanned
+            PDFs with no text layer need OCR, which is also not included.</p>
+        </div>
+      </div>
+    </details>
+  </section>
+
+</main>
+
+<footer class="foot wrap">
+  <p>Runs locally. Your material is sent only to the model you configured.</p>
+</footer>
+
+<script src="/static/mermaid.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

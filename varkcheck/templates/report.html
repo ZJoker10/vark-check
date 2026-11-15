@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{{ report.title }}</title>
+<style>
+  @page {
+    size: A4;
+    margin: 18mm 16mm 20mm 16mm;
+    @bottom-center {
+      content: "{{ report.title|e }}  ·  page " counter(page) " of " counter(pages);
+      font-size: 8pt; color: #8a8f98;
+    }
+  }
+  @page :first { margin-top: 14mm; }
+
+  * { box-sizing: border-box; }
+  html { font-size: 10.5pt; }
+  body {
+    font-family: {% if style == 'R' %}"DejaVu Serif", Georgia, serif
+                 {% elif style == 'A' %}"DejaVu Serif", Georgia, serif
+                 {% else %}"DejaVu Sans", Helvetica, Arial, sans-serif{% endif %};
+    color: #1c1f24; line-height: {{ '1.55' if style in ('R','A') else '1.45' }};
+    margin: 0;
+  }
+
+  /* ---- palette per style: the report should feel different, not just say it ---- */
+  :root { --accent: {{ accent }}; --tint: {{ tint }}; --rule: #e3e6ea; }
+
+  .cover { border-top: 6px solid var(--accent); padding-top: 10mm; }
+  .eyebrow {
+    font-size: 8pt; letter-spacing: .14em; text-transform: uppercase;
+    color: var(--accent); font-weight: 700; margin-bottom: 4mm;
+  }
+  h1 { font-size: {{ '26pt' if style == 'A' else '22pt' }}; line-height: 1.15; margin: 0 0 3mm 0; font-weight: 700; }
+  .one-line {
+    font-size: {{ '12.5pt' if style == 'A' else '11pt' }};
+    color: #4a5058; margin: 0 0 6mm 0;
+    {% if style == 'A' %}font-style: italic;{% endif %}
+  }
+
+  .profile { display: flex; gap: 8mm; align-items: center; margin: 6mm 0 4mm 0; }
+  .profile img { width: 62mm; height: auto; }
+  .profile-facts { font-size: 9pt; color: #4a5058; }
+  .profile-facts strong { color: #1c1f24; }
+
+  .caveat {
+    margin: 5mm 0 0 0; padding: 3.5mm 4mm; border-left: 3px solid var(--accent);
+    background: var(--tint); font-size: 8.5pt; color: #3c424b;
+  }
+
+  h2 {
+    font-size: {{ '15pt' if style == 'A' else '13pt' }};
+    margin: 9mm 0 3mm 0; padding-bottom: 1.5mm;
+    border-bottom: 1px solid var(--rule); color: #11141a;
+    {% if style == 'R' %}font-variant: small-caps; letter-spacing: .04em;{% endif %}
+  }
+  h2 .num { color: var(--accent); margin-right: 2.5mm; font-variant: normal; }
+  h3 { font-size: 11pt; margin: 5mm 0 1.5mm 0; }
+  p { margin: 0 0 2.6mm 0; {% if style == 'R' %}text-align: justify;{% endif %} }
+  ul, ol { margin: 0 0 3mm 0; padding-left: 6mm; }
+  li { margin-bottom: 1.4mm; }
+  strong { color: #11141a; }
+  code { font-family: "DejaVu Sans Mono", monospace; font-size: 8.5pt; background: #f2f4f7; padding: 0 .6mm; }
+  blockquote { margin: 0 0 3mm 0; }
+
+  .summary {
+    font-size: {{ '11.5pt' if style == 'A' else '10.5pt' }};
+    {% if style == 'A' %}line-height: 1.7;{% endif %}
+    {% if style == 'R' %}text-align: justify;{% endif %}
+  }
+
+  /* ---- source chips ---- */
+  .source {
+    display: inline-block; font-size: 7.5pt; color: #5a616b;
+    background: #f4f6f8; border: 1px solid var(--rule); border-radius: 2px;
+    padding: .4mm 1.6mm; margin-top: 1mm;
+  }
+
+  /* ---- diagrams ---- */
+  .diagram { border: 1px solid var(--rule); border-radius: 3px; padding: 4mm; margin: 0 0 5mm 0; page-break-inside: avoid; }
+  .diagram .title { font-weight: 700; font-size: 9.5pt; margin-bottom: 2mm; }
+  .diagram img, .diagram svg { width: 100%; height: auto; max-height: 90mm; }
+  .diagram img { display: block; margin: 0 auto; }
+  .diagram .caption { font-size: 8.5pt; color: #5a616b; margin-top: 2mm; }
+  .diagram .pending { font-family: "DejaVu Sans Mono", monospace; font-size: 7.5pt; white-space: pre-wrap; color: #6b7280; background: #f8f9fb; padding: 3mm; }
+  .diagram .note { font-size: 7.5pt; color: #9aa0a8; font-style: italic; }
+
+  /* ---- tables ---- */
+  table.data { width: 100%; border-collapse: collapse; margin: 0 0 5mm 0; font-size: 8.8pt; page-break-inside: avoid; }
+  table.data th { background: var(--tint); text-align: left; padding: 1.8mm 2mm; border-bottom: 1.2px solid var(--accent); }
+  table.data td { padding: 1.6mm 2mm; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  .table-title { font-weight: 700; font-size: 9pt; margin: 0 0 1.5mm 0; }
+
+  /* ---- terms ---- */
+  dl.terms { margin: 0; }
+  dl.terms dt { font-weight: 700; margin-top: 2.4mm; }
+  dl.terms dd { margin: 0 0 1mm 0; color: #333840; }
+
+  /* ---- kinesthetic steps & checks ---- */
+  .step { border-left: 3px solid var(--accent); padding: 0 0 0 4mm; margin: 0 0 4mm 0; page-break-inside: avoid; }
+  .step .n { font-size: 8pt; font-weight: 700; color: var(--accent); letter-spacing: .08em; }
+  .check { border: 1px dashed var(--rule); border-radius: 3px; padding: 3mm; margin-bottom: 3mm; page-break-inside: avoid; }
+  .check .q { font-weight: 700; font-size: 9.5pt; }
+  .check .h { font-size: 8.5pt; color: #5a616b; margin-top: 1mm; }
+
+  .plan { background: var(--tint); padding: 4mm 5mm; border-radius: 3px; }
+
+  .sources { font-size: 8pt; color: #5a616b; }
+  .sources li { margin-bottom: 1mm; }
+  .warn { background: #fff6e5; border-left: 3px solid #d99a00; padding: 3mm 4mm; font-size: 8.5pt; margin: 4mm 0; }
+  .footer { margin-top: 10mm; padding-top: 3mm; border-top: 1px solid var(--rule); font-size: 7.5pt; color: #9aa0a8; }
+</style>
+</head>
+<body>
+
+<div class="cover">
+  <div class="eyebrow">Study report · tuned for {{ style_label }}</div>
+  <h1>{{ report.title|e }}</h1>
+  {% if report.one_line %}<p class="one-line">{{ report.one_line|e }}</p>{% endif %}
+
+  <div class="profile">
+    <img src="data:image/png;base64,{{ profile_chart }}" alt="VARK profile chart">
+    <div class="profile-facts">
+      <p><strong>Declared preference:</strong> {{ style_label }} ({{ dominant_score }}/1.00)</p>
+      {% if secondary %}<p><strong>Also strong:</strong> {{ secondary_label }} ({{ secondary_score }}/1.00)</p>{% endif %}
+      <p><strong>Material:</strong> {{ files }} </p>
+      <p><strong>Length:</strong> {{ source_chars }} characters across {{ section_count }} section(s)</p>
+      {% if assessed %}<p><strong>Assessed:</strong> {{ assessed }}</p>{% endif %}
+    </div>
+  </div>
+
+  <div class="caveat">
+    <strong>Read this as a hypothesis.</strong> This report is shaped for a {{ style_label|lower }}
+    preference because that is how you described yourself, not because you have been diagnosed.
+    Evidence that matching teaching to a preferred style improves learning is weak
+    (Pashler et al., 2008). If a different shape works better for this material, use that one —
+    the goal is the understanding, not the label.
+  </div>
+</div>
+
+{% if warnings %}
+<div class="warn">
+  <strong>Worth knowing:</strong>
+  <ul>{% for warning in warnings %}<li>{{ warning|e }}</li>{% endfor %}</ul>
+</div>
+{% endif %}
+
+{{ blocks | safe }}
+
+<div class="footer">
+  Generated locally by VARK Check · {{ generated_at }} · prompt set v{{ prompt_version }}
+  · {{ tokens }} tokens<br>
+  Every claim above is cited to the material you uploaded. Nothing was fetched from outside it.
+</div>
+
+</body>
+</html>

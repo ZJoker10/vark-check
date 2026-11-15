@@ -1,11 +1,12 @@
-# The agent core (retrieval, guardrails, orchestrator, SQLite memory) uses the
-# Python standard library ONLY. Streamlit is the single required dependency.
+# v1 — the Streamlit study assistant (unchanged)
 streamlit>=1.36
 
-# --- Optional upgrades (the code detects these and degrades gracefully) ---
-# Better embeddings than the built-in hashing TF-IDF retriever:
-# sentence-transformers>=2.7
-# PDF ingestion (data/course/*.pdf). Markdown and .txt work out of the box:
-# pypdf>=4.2
-# Offline text-to-speech for the "A" (aural) format:
-# pyttsx3>=2.90
+# --- v2: the local web app (`python -m varkcheck.web`) ------------------- #
+# Everything below is required for v2 only; v1 keeps working without it.
+pypdf>=4.2                     # PDF text extraction
+python-docx>=1.1               # DOCX extraction and export
+markdown>=3.6                  # model markdown -> HTML
+jinja2>=3.1                    # report template
+pillow>=10.0                   # profile chart
+weasyprint>=62                 # HTML -> PDF
+cairosvg>=2.7                  # SVG -> PNG for the DOCX export

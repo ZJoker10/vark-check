@@ -22,10 +22,16 @@ declared preference  ──►  4 formats  ──►  4 quizzes  ──►  obse
                     has not grasped yet, with the source
 ```
 
+**v2** flips it around: instead of measuring which format works on *our* course,
+it summarises *your* material in the format your profile points to —
+`python -m varkcheck.web`, upload, one questionnaire, download. See
+[v2 — bring your own material](#v2--bring-your-own-material).
+
 ---
 
 ## Contents
 
+- [v2 — bring your own material](#v2--bring-your-own-material)
 - [What makes this an agent, not a chatbot](#what-makes-this-an-agent-not-a-chatbot)
 - [Run it in 60 seconds](#run-it-in-60-seconds)
 - [Quickstart](#quickstart)
@@ -41,6 +47,127 @@ declared preference  ──►  4 formats  ──►  4 quizzes  ──►  obse
 - [Limits & risks](#limits--risks)
 - [Team](#team)
 - [References](#references)
+
+---
+
+## v2 — bring your own material
+
+v1 is a fixed experiment: one course, four formats, measure which one worked.
+v2 answers the question students actually ask next — *"can you do that to **my**
+notes?"*
+
+Upload your material, take the questionnaire once, pick a shape, download the
+report. Same VARK framing, same caveat, but the content is yours instead of
+`data/course/`.
+
+```bash
+pip install -r requirements.txt
+python -m varkcheck.web                 # http://127.0.0.1:8765
+python -m varkcheck.web --provider ollama --model llama3.1
+```
+
+A local server rather than a `file://` page, for three reasons: the API key stays
+on the machine it belongs to, a PDF can actually be assembled, and there is no
+CORS dance to reach a local model. It is stdlib `ThreadingHTTPServer` — v2 adds
+no web framework.
+
+### The flow
+
+1. **Read** — drop PDFs, DOCX, Markdown, plain text, pasted text or images. Up to
+   20 files, 25 MB each. The page tells you what it actually extracted (sections,
+   characters, headings, images) *before* anything is generated, because the
+   commonest failure is a scanned PDF with no text layer.
+2. **Declare** — the same eight items as v1, scored server-side, then kept in the
+   browser's `localStorage`. Taking it once means never taking it again in that
+   browser, and the emphasis *"a starting hypothesis, not a diagnosis"* is stated
+   in the quiz, the profile card, the report and the exported file.
+3. **Choose a shape** — the same material becomes four genuinely different
+   documents. Not the same text with a different accent colour: the block order,
+   the prose register, the units and what is present all change.
+
+| | Visual | Aural | Read / write | Kinesthetic |
+|---|---|---|---|---|
+| Order | diagrams → terms → prose | summary → spoken explanation → glossary | definitions → numbered analysis → tables | numbered steps → self-checks |
+| Diagrams | 1–3, required | **never** | never | at most 1 |
+| Tables | yes | no | yes | no |
+| Prose register | captions and labels | "say it out loud" narration | dense, formal, numbered | imperative, one action per step |
+
+The shape is enforced in code, not requested in the prompt — `_normalise()`
+strips diagrams from an aural report even when the model sends them, because a
+report with a flowchart in it is not an aural report.
+
+### What makes it a summary and not an excerpt
+
+This is the part worth reading. Four checks run on every draft, and any of them
+can send it back to the model once:
+
+| Guardrail | Rule | Where |
+|---|---|---|
+| **Synthesis** | 6-word shingle containment against the source. A sentence is "copied" at ≥ 0.55 similarity; a draft over 30 % copied is rejected. | `varkcheck/synthesis.py` |
+| **Coverage** | The document is grouped into parts with their own sources; the report must cite each part. Missing parts are named in the retry prompt. | `summarize.part_coverage` / `_missing_parts` |
+| **Shape** | Summary must be 90–420 words, must not describe itself ("This report covers…"), and a visual report must contain a usable diagram. | `summarize._quality_issues` |
+| **Grounding** | Every `source: file §section` is resolved against the passages actually sent. An invented citation is replaced with the best real match, or the item is dropped. | `summarize._normalise` |
+
+If the second draft still falls short, the report ships **with the failure stated
+on the page** — "the summary is 60 words", "nothing in the report comes from
+Lecture 1" — rather than silently pretending. The better of the two drafts is
+the one kept: a genuine summary with one flaw beats a rewrite that copies its
+source, and among drafts that both copy, the one that copies less wins. When a
+weaker model returns an unusable diagram, a visual report falls back to a
+hierarchy chart built from the document's own headings, and says so in the
+caption. The page also tells you when a draft was rewritten; the exported file
+reports only what is still wrong with the document you are holding.
+
+### Export
+
+PDF (WeasyPrint), DOCX (`python-docx`), or Markdown. Diagrams are drawn in the
+browser — Mermaid runs in the parent page over the preview iframe's DOM, so no
+Node and no headless Chrome are needed — and the resulting SVG is posted back and
+embedded in the file. In the DOCX it is rasterised with `cairosvg`. In the
+Markdown the Mermaid source is kept, which is what you want in a repo.
+
+### Privacy
+
+No account, no cookie, no analytics, and the server does not log IP addresses.
+Uploads live in an in-memory session keyed by a random token, capped at 8
+sessions, discarded after two hours, and their temp directories deleted. Your
+answers never leave the browser except as part of a report request. The only
+outbound traffic is the prompt to the model you configured — run
+`--provider ollama` and there is none at all.
+
+Images are **embedded as figures, not interpreted**. There is no vision model in
+this build, so a picture of a diagram is placed in the report with its caption
+and nothing is claimed about its contents. The UI says this in as many words.
+
+### What v2 does not do
+
+- **Small local models struggle.** `llama3.1` (8B) frequently produces 60-word
+  summaries that describe the report instead of the material, and covers one
+  lecture out of three even after a retry. `gemma4:12b` obeys the schema and the
+  coverage rule reliably at ~25 s per call. The guardrails surface the difference
+  honestly instead of hiding it; a frontier model is the obvious setting for
+  marking, and `--provider deepseek` is one flag away.
+- **No OCR.** A scanned PDF yields a warning, not a report.
+- **No recognition.** Nothing learns across sessions; two uploads of the same
+  file are two unrelated documents.
+- WeasyPrint's flexbox support is partial, so wide layouts stack. Legible, not
+  pixel-perfect.
+
+### Where it lives
+
+```
+varkcheck/web/          server.py, __main__.py, static/{index.html,app.js,style.css,mermaid.min.js}
+varkcheck/uploads.py    PDF/DOCX/MD/TXT/image extraction -> Document/Section/Figure
+varkcheck/profile.py    Profile, score(), describe(), localStorage serialisation
+varkcheck/synthesis.py  the copy detector and its retry instruction
+varkcheck/summarize.py  passage selection, coverage, quality gate, retry loop
+varkcheck/render.py     HTML / PDF / DOCX / Markdown, prompt-injection sanitiser
+varkcheck/templates/    report.html — one template, four styles
+prompts/report.md       SHARED_RULES + REPORT_V/A/R/K + schema (version 2.0.0)
+tests/test_v2.py        54 tests: extraction, coverage, profiling, copy check, renderers
+```
+
+v1 is untouched: `app.py` and its 86 tests still run exactly as before.
 
 ---
 
@@ -105,9 +232,11 @@ pip install sentence-transformers        # better embeddings than the built-in T
 | HTTP | `urllib` (stdlib) | No dependency for a 60-line transport |
 | Tests | `unittest` classes (pytest-compatible) | Runs with or without pytest installed |
 
-The agent core has **one** third-party dependency: Streamlit. Everything else is
-standard library, which is why `scripts/demo_flow.py` and all 86 tests run on a
-bare interpreter.
+The v1 agent core has **one** third-party dependency: Streamlit. Everything else
+is standard library, which is why `scripts/demo_flow.py` and the 86 v1 tests run
+on a bare interpreter. v2 is where the real dependencies live — WeasyPrint,
+`python-docx`, `pypdf`, `cairosvg` — because turning model prose into a PDF (and
+a diagram into a DOCX image) is not something to hand-roll.
 
 ---
 
@@ -270,7 +399,7 @@ either produces the same "I've flagged this for your lecturer" path.
 pytest -q                      # or: python -m unittest discover -s tests
 ```
 
-**86 tests, ~3 seconds, no network, no API key.** They run against the real
+**140 tests, ~15 seconds, no network, no API key.** They run against the real
 course material in `data/course/`, so they fail if the demo material stops being
 indexable.
 
@@ -283,6 +412,7 @@ indexable.
 | `test_tools.py` | every tool, including cache hits, hidden keys, empty answers costing no tokens, leak replacement, bad arguments |
 | `test_agent.py` | the loop, step/token budgets, protocol failures, provider failure, both fallbacks, profile written even if the model forgets |
 | `test_scenarios.py` | replay of the five documented interactions, including the two boundary cases |
+| `test_v2.py` | upload extraction (order, bad files, image figures, caps), part coverage and sampling, profile clamping, the copy detector, blank-reply recovery, and each renderer — including that a PDF has no escaped HTML and that all four styles differ |
 
 ---
 
@@ -290,10 +420,11 @@ indexable.
 
 ```
 vark-check/
-├── app.py                     Streamlit UI: student page + lecturer digest
+├── app.py                     Streamlit UI: student page + lecturer digest          (v1)
 ├── prompts/
 │   ├── system.md              ROLE · GOAL · RULES · PROCEDURE · OUTPUT FORMAT (versioned)
-│   └── tasks.md               per-tool instructions (versioned)
+│   ├── tasks.md               per-tool instructions (versioned)
+│   └── report.md              v2: SHARED_RULES + per-style report briefs + schema
 ├── varkcheck/
 │   ├── agent.py               plan → act → observe loop, budgets, hand-over, fallbacks
 │   ├── tools.py               the seven tools + registry + observation caps
@@ -307,13 +438,20 @@ vark-check/
 │   ├── prompts.py             prompt loader with version tags
 │   ├── trace.py               JSONL tracing
 │   ├── seed.py                synthetic cohort (fixed seed)
-│   └── offline.py             deterministic stand-in model for tests/demo
+│   ├── offline.py             deterministic stand-in model for tests/demo
+│   ├── uploads.py             v2: PDF/DOCX/MD/TXT/image → Document/Section/Figure
+│   ├── profile.py             v2: scoring, describe(), localStorage round-trip
+│   ├── synthesis.py           v2: the copy detector and its retry instruction
+│   ├── summarize.py           v2: passages, coverage, quality gate, retry loop
+│   ├── render.py              v2: HTML/PDF/DOCX/Markdown + sanitiser
+│   ├── templates/report.html  v2: one template, four styles
+│   └── web/                   v2: server.py, __main__.py, static/
 ├── data/course/               the real material the agent is allowed to use
 ├── scripts/
 │   ├── ingest.py              build/rebuild the index
 │   ├── seed_demo.py           refresh the synthetic cohort, print the digest
 │   └── demo_flow.py           end-to-end walkthrough, no API key
-├── tests/                     86 tests
+├── tests/                     140 tests (86 v1 + 54 v2)
 └── docs/
     ├── architecture.md
     └── example_interactions.md

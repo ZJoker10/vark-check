@@ -77,7 +77,9 @@ class ChatClient:
             "max_tokens": self.settings.max_output_tokens if max_tokens is None else max_tokens,
             "stream": False,
         }
-        if json_mode and self.settings.provider in ("deepseek", "openai"):
+        if json_mode:
+            # Ollama, DeepSeek and OpenAI all honour this on the /v1 surface;
+            # without it small local models happily answer in prose.
             payload["response_format"] = {"type": "json_object"}
 
         started = time.perf_counter()
@@ -86,8 +88,18 @@ class ChatClient:
 
         try:
             text = data["choices"][0]["message"]["content"] or ""
+            finish = data["choices"][0].get("finish_reason")
         except (KeyError, IndexError, TypeError) as exc:
             raise LLMError(f"Unexpected response shape: {str(data)[:300]}") from exc
+
+        if not text.strip():
+            text, finish, data = self._recover_empty(payload, text, finish, data, json_mode)
+
+        if not text.strip():
+            raise LLMError(
+                f"The model returned an empty reply (finish_reason={finish!r}). "
+                "Try a larger max output token budget or a different model."
+            )
 
         raw_usage = data.get("usage") or {}
         usage = Usage(
@@ -107,6 +119,49 @@ class ChatClient:
         return LLMReply(text=text, usage=usage, model=self.settings.model, latency_ms=latency_ms)
 
     # -- transport --------------------------------------------------------- #
+    def _recover_empty(
+        self,
+        payload: dict[str, Any],
+        text: str,
+        finish: Any,
+        data: dict[str, Any],
+        json_mode: bool,
+    ) -> tuple[str, Any, dict[str, Any]]:
+        """Two cheap recoveries for a reply that came back blank.
+
+        Small local models blank out for two different reasons, and they are
+        worth telling apart:
+
+        * ``finish_reason == "length"`` — the model spent the whole budget
+          thinking (``qwen3``, ``gemma`` with a long prompt) and never emitted
+          content. Raising the ceiling is the fix.
+        * anything else, with ``json_mode`` on — some models answer a
+          ``json_object`` request with nothing at all. Asking again without the
+          flag works, and costs one call.
+        """
+        attempts: list[dict[str, Any]] = []
+        if finish == "length":
+            ceiling = min(16_000, int(payload.get("max_tokens") or 1000) * 2)
+            if ceiling > int(payload.get("max_tokens") or 0):
+                attempts.append({**payload, "max_tokens": ceiling})
+        if json_mode:
+            without = {key: value for key, value in payload.items() if key != "response_format"}
+            attempts.append(without)
+            if finish == "length":
+                ceiling = min(16_000, int(payload.get("max_tokens") or 1000) * 2)
+                attempts.append({**without, "max_tokens": ceiling})
+
+        for candidate in attempts:
+            try:
+                data = self._post(candidate)
+                text = data["choices"][0]["message"]["content"] or ""
+                finish = data["choices"][0].get("finish_reason")
+            except (KeyError, IndexError, TypeError, LLMError):
+                continue
+            if text.strip():
+                return text, finish, data
+        return text, finish, data
+
     def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
         url = f"{self.settings.base_url.rstrip('/')}/chat/completions"
         body = json.dumps(payload).encode("utf-8")
