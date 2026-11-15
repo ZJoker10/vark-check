@@ -308,10 +308,11 @@ async function generate() {
 
   const label = $("#generate-status");
   const started = Date.now();
-  status(label, "Writing the report… 0s");
+  status(label, "Reading the material one part at a time… 0s");
 
   const ticker = setInterval(() => {
-    status(label, `Writing the report… ${Math.round((Date.now() - started) / 1000)}s`);
+    const seconds = Math.round((Date.now() - started) / 1000);
+    status(label, `Reading the material one part at a time… ${seconds}s`);
   }, 1000);
 
   try {
@@ -323,7 +324,9 @@ async function generate() {
     clearInterval(ticker);
     state.report = result.report;
     state.html = result.html;
-    status(label, `Done in ${Math.round((Date.now() - started) / 1000)}s.`, "good");
+    const parts = result.report?.coverage;
+    const covered = parts ? ` ${parts.covered}/${parts.parts} parts covered.` : "";
+    status(label, `Done in ${Math.round((Date.now() - started) / 1000)}s.${covered}`, "good");
     await showPreview(result.html, result.report);
   } catch (error) {
     clearInterval(ticker);

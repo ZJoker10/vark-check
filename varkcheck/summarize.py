@@ -30,8 +30,13 @@ from .profile import Profile, label
 
 PASSAGE_CHARS = 1800
 DEFAULT_BUDGET_CHARS = 16_000
-PROMPT_VERSION = "2.0.0"
-REPORT_MAX_TOKENS = 4000
+PART_BUDGET_CHARS = 7_000
+MAX_PARTS = 6
+PART_MAX_TOKENS = 2200
+COMPOSE_MAX_TOKENS = 4000
+SUMMARY_MIN_WORDS = 200
+SUMMARY_MAX_WORDS = 480
+PROMPT_VERSION = "3.0.1"
 
 _MERMAID_START = re.compile(r"^\s*(flowchart|graph|sequenceDiagram|mindmap|stateDiagram|classDiagram)\b", re.MULTILINE)
 
@@ -104,7 +109,12 @@ class Report:
 # Passage selection
 # --------------------------------------------------------------------------- #
 def select_passages(document: uploads.Document, budget_chars: int = DEFAULT_BUDGET_CHARS) -> list[uploads.Section]:
-    """Evenly strided selection, so the report reflects the whole document."""
+    """Evenly strided selection across the whole document.
+
+    The report path no longer uses this — it reads one part at a time
+    (`_part_passages`) — but a caller that wants one flat, budgeted selection of
+    the whole upload still gets a representative sample rather than the opening.
+    """
     chunks = uploads.chunk(document, max_chars=PASSAGE_CHARS)
     if not chunks:
         return []
@@ -174,6 +184,27 @@ _META = re.compile(
     r"^\s*(this|the)\s+(report|summary|document|page)\b|^\s*in this (report|summary)\b",
     re.IGNORECASE,
 )
+_META_LEAD = re.compile(
+    r"^\s*(this|the)\s+(report|summary|document|page)\s+"
+    r"(covers|explains|describes|includes|shows|presents|outlines|will|is about)\s+",
+    re.IGNORECASE,
+)
+
+
+def _drop_meta_lead(text: str) -> str:
+    """Delete a leading "This report covers …" without rewriting what follows.
+
+    The rule is that the report describes the subject, not itself — but a weak
+    model still opens that way, and spending a retry to fix three words wastes a
+    minute. The phrase carries no content of its own, so it is removed here and
+    the sentence it introduced is kept, capitalised.
+    """
+    cleaned = _META_LEAD.sub("", text or "", count=1).strip()
+    if not cleaned:
+        return text
+    if cleaned[0].islower():
+        cleaned = cleaned[0].upper() + cleaned[1:]
+    return cleaned
 
 
 def _quality_issues(
@@ -182,14 +213,31 @@ def _quality_issues(
     """Things the copy check cannot see but that still make the report wrong."""
     issues: list[str] = []
     words = len(report.summary.split())
-    if words < 90:
-        issues.append(f"The summary is {words} words. Write 120–220 words that name the material's parts.")
-    elif words > 420:
-        issues.append(f"The summary is {words} words. Cut it to 120–220; compression is the job.")
-    if _META.match(report.summary):
+    # A 300-word handout cannot support a 200-word overview. Ask for what the
+    # material can actually give, rather than an impossible target.
+    source_words = max(1, getattr(document, "chars", 0) // 6)
+    floor = min(SUMMARY_MIN_WORDS, max(60, source_words // 2))
+    ceiling = min(SUMMARY_MAX_WORDS, floor + 280)
+    if words < floor:
         issues.append(
-            "The summary describes the report ('This report covers...'). Describe the subject instead, "
-            "as though the reader had not seen the material."
+            f"The summary is {words} words, too short to be a map of the material. Write "
+            f"{floor}–{ceiling} words: one short paragraph per part, then a "
+            "closing sentence that connects them."
+        )
+    elif words > SUMMARY_MAX_WORDS + 120:
+        issues.append(
+            f"The summary is {words} words. Cut it to {SUMMARY_MIN_WORDS}–{SUMMARY_MAX_WORDS}; "
+            "compression is the job."
+        )
+    meta = [
+        name
+        for name, value in (("summary", report.summary), ("one_line", report.one_line))
+        if value and _META.match(value)
+    ]
+    if meta:
+        issues.append(
+            f"The {' and '.join(meta)} describes the report ('This report covers...'). Describe the "
+            "subject instead, as though the reader had not seen the material."
         )
     missing = _missing_parts(report, coverage)
     if missing:
@@ -329,6 +377,32 @@ _EDGE = re.compile(r"(-->|---|==>|-.->)")
 _LABEL = re.compile(r"[\[\{\(]\s*([^\]\}\)]+?)\s*[\]\}\)]")
 
 
+def _has_spaced_node_id(code: str) -> bool:
+    """True when a node is named with two words, e.g. `Learning Rate[...]`.
+
+    Mermaid reads that as the node `Learning` followed by an unexpected token
+    and aborts the whole diagram. Labels may contain spaces; ids may not.
+    Strip every bracketed label first, then look for two bare words in a row
+    where a single id or an arrow should be.
+    """
+    for pattern, replacement in (
+        (r"\[[^\]]*\]", "[]"),
+        (r"\{[^}]*\}", "{}"),
+        (r"\([^)]*\)", "()"),
+        (r"\|[^|]*\|", "||"),
+    ):
+        code = re.sub(pattern, replacement, code)
+    for raw in code.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(
+            ("flowchart", "graph", "%%", "subgraph", "end", "class", "style", "click", "linkStyle", "direction")
+        ):
+            continue
+        if re.search(r"[A-Za-z0-9_]\s+[A-Za-z0-9_]", line):
+            return True
+    return False
+
+
 def _valid_mermaid(code: str) -> bool:
     code = (code or "").strip()
     if len(code) < 12 or len(code) > 2500:
@@ -347,6 +421,9 @@ def _valid_mermaid(code: str) -> bool:
     stripped = re.sub(r"<?[-=.]+>?", "", stripped)
     if re.search(r"[<>]", stripped):
         return False
+    # A node id with a space in it aborts the render ("got 'NODE_STRING'").
+    if _has_spaced_node_id(code):
+        return False
     # A diagram of one arrow is a placeholder, not an explanation.
     if len(_EDGE.findall(code)) < 2:
         return False
@@ -359,26 +436,28 @@ def _valid_mermaid(code: str) -> bool:
     return True
 
 
-def _normalise(raw: dict[str, Any], *, style: str, passages: list[uploads.Section]) -> Report:
-    warnings: list[str] = []
-    dropped = 0
+class _Resolver:
+    """Map model-written citations onto the passages that were actually sent."""
 
-    allowed = {passage.source for passage in passages}
-    seen: set[str] = set()
+    def __init__(self, passages: list[uploads.Section]) -> None:
+        self.passages = passages
+        self.seen: set[str] = set()
+        self.dropped = 0
 
-    def resolve(value: Any, context: str) -> str | None:
-        nonlocal dropped
-        resolved = _resolve(_text(value, 200), passages)
+    def __call__(self, value: Any, context: str) -> str | None:
+        resolved = _resolve(_text(value, 200), self.passages)
         if resolved is None:
-            resolved = _best_source(context, passages)
+            resolved = _best_source(context, self.passages)
         if resolved is None:
-            dropped += 1
+            self.dropped += 1
             return None
-        seen.add(resolved)
+        self.seen.add(resolved)
         return resolved
 
+
+def _collect_sections(raw: Any, resolve: _Resolver, limit: int = 12) -> list[dict[str, Any]]:
     sections: list[dict[str, Any]] = []
-    for item in _list(raw.get("sections"))[:12]:
+    for item in _list(raw)[:limit]:
         if not isinstance(item, dict):
             continue
         heading = _text(item.get("heading"), 120)
@@ -389,9 +468,12 @@ def _normalise(raw: dict[str, Any], *, style: str, passages: list[uploads.Sectio
         if source is None:
             continue
         sections.append({"heading": heading, "body": body, "source": source})
+    return sections
 
-    key_terms: list[dict[str, Any]] = []
-    for item in _list(raw.get("key_terms"))[:10]:
+
+def _collect_terms(raw: Any, resolve: _Resolver, limit: int = 10) -> list[dict[str, Any]]:
+    terms: list[dict[str, Any]] = []
+    for item in _list(raw)[:limit]:
         if not isinstance(item, dict):
             continue
         term = _text(item.get("term"), 80)
@@ -401,15 +483,20 @@ def _normalise(raw: dict[str, Any], *, style: str, passages: list[uploads.Sectio
         source = resolve(item.get("source"), f"{term} {meaning}")
         if source is None:
             continue
-        key_terms.append({"term": term, "meaning": meaning, "source": source})
+        terms.append({"term": term, "meaning": meaning, "source": source})
+    return terms
 
+
+def _collect_diagrams(raw: Any, warnings: list[str], limit: int = 4) -> list[dict[str, Any]]:
     diagrams: list[dict[str, Any]] = []
-    for item in _list(raw.get("diagrams"))[:4]:
+    for item in _list(raw)[:limit]:
         if not isinstance(item, dict):
             continue
         code = _text(item.get("mermaid"), 2500)
         if not _valid_mermaid(code):
-            warnings.append(f"Diagram '{_text(item.get('title'), 60) or 'untitled'}' was malformed and is not shown.")
+            warnings.append(
+                f"Diagram '{_text(item.get('title'), 60) or 'untitled'}' was malformed and is not shown."
+            )
             continue
         diagrams.append(
             {
@@ -418,9 +505,12 @@ def _normalise(raw: dict[str, Any], *, style: str, passages: list[uploads.Sectio
                 "mermaid": code,
             }
         )
+    return diagrams
 
+
+def _collect_tables(raw: Any, limit: int = 3) -> list[dict[str, Any]]:
     tables: list[dict[str, Any]] = []
-    for item in _list(raw.get("tables"))[:3]:
+    for item in _list(raw)[:limit]:
         if not isinstance(item, dict):
             continue
         columns = [_text(column, 60) for column in _list(item.get("columns"))][:6]
@@ -438,28 +528,52 @@ def _normalise(raw: dict[str, Any], *, style: str, passages: list[uploads.Sectio
                     "rows": rows,
                 }
             )
+    return tables
 
+
+def _collect_checks(raw: Any, limit: int = 6) -> list[dict[str, Any]]:
     checks: list[dict[str, Any]] = []
-    for item in _list(raw.get("checks"))[:6]:
+    for item in _list(raw)[:limit]:
         if not isinstance(item, dict):
             continue
         question = _text(item.get("question"), 300)
         if question:
             checks.append({"question": question, "hint": _text(item.get("hint"), 300)})
+    return checks
 
-    study_plan = [item for item in (_text(entry, 200) for entry in _list(raw.get("study_plan"))[:5]) if item]
 
-    # The shape of the document is part of the deliverable, so it is enforced
-    # here rather than trusted to the prompt: an aural report with diagrams is
-    # not an aural report.
+def _collect_plan(raw: Any, limit: int = 5) -> list[str]:
+    return [item for item in (_text(entry, 200) for entry in _list(raw)[:limit]) if item]
+
+
+def _shape(
+    diagrams: list[dict[str, Any]], tables: list[dict[str, Any]], style: str
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """The shape of the document is part of the deliverable, so it is enforced
+    here rather than trusted to the prompt: an aural report with diagrams is not
+    an aural report."""
     if style == "A":
-        diagrams, tables = [], []
-    elif style == "R":
-        diagrams = []
-    elif style == "K":
-        diagrams = diagrams[:1]
+        return [], []
+    if style == "R":
+        return [], tables
+    if style == "K":
+        return diagrams[:1], []
+    return diagrams, tables
 
-    summary = _text(raw.get("summary"), 2600)
+
+def _normalise(raw: dict[str, Any], *, style: str, passages: list[uploads.Section]) -> Report:
+    warnings: list[str] = []
+    resolve = _Resolver(passages)
+
+    sections = _collect_sections(raw.get("sections"), resolve)
+    key_terms = _collect_terms(raw.get("key_terms"), resolve)
+    diagrams = _collect_diagrams(raw.get("diagrams"), warnings)
+    tables = _collect_tables(raw.get("tables"))
+    checks = _collect_checks(raw.get("checks"))
+    study_plan = _collect_plan(raw.get("study_plan"))
+    diagrams, tables = _shape(diagrams, tables, style)
+
+    summary = _text(raw.get("summary"), 3200)
     if not summary:
         summary = " ".join(section["body"] for section in sections[:2])[:1200]
 
@@ -474,73 +588,290 @@ def _normalise(raw: dict[str, Any], *, style: str, passages: list[uploads.Sectio
         tables=tables,
         checks=checks,
         study_plan=study_plan,
-        citations=_unique(passage.source for passage in passages if passage.source in seen),
+        citations=_unique(passage.source for passage in passages if passage.source in resolve.seen),
         warnings=warnings,
-        dropped=dropped,
+        dropped=resolve.dropped,
     )
     if not sections:
         raise ValueError("The model returned no usable sections.")
     return report
 
 
+def _merge_terms(
+    primary: list[dict[str, Any]], extra: list[dict[str, Any]], limit: int = 10
+) -> list[dict[str, Any]]:
+    """Glossary from the part passes, topped up by the composing pass."""
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for term in [*primary, *extra]:
+        key = str(term.get("term", "")).strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(term)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _assemble(
+    raw: dict[str, Any],
+    *,
+    style: str,
+    sections: list[dict[str, Any]],
+    terms: list[dict[str, Any]],
+    passages: list[uploads.Section],
+) -> Report:
+    """Build the report from per-part sections plus the composing pass's extras.
+
+    The sections are not re-generated here: they were written one part at a time,
+    which is what keeps a weak model from quietly dropping a lecture. This step
+    only adds the things that need the whole document in view — title, overview,
+    diagrams, comparison table, self-checks, study plan.
+    """
+    warnings: list[str] = []
+    resolve = _Resolver(passages)
+    for section in sections:
+        resolve.seen.add(section["source"])
+
+    key_terms = _merge_terms(terms, _collect_terms(raw.get("key_terms"), resolve))
+    diagrams = _collect_diagrams(raw.get("diagrams"), warnings)
+    tables = _collect_tables(raw.get("tables"))
+    checks = _collect_checks(raw.get("checks"))
+    study_plan = _collect_plan(raw.get("study_plan"))
+    diagrams, tables = _shape(diagrams, tables, style)
+
+    summary = _drop_meta_lead(_text(raw.get("summary"), 4000))
+    if not summary:
+        # A missing overview is worse than a plain one: the sections below still
+        # carry the material.
+        summary = " ".join(section["body"] for section in sections[:2])[:1600]
+
+    cited = _unique([section["source"] for section in sections] + list(resolve.seen))
+    return Report(
+        title=_text(raw.get("title"), 120) or "Study report",
+        one_line=_drop_meta_lead(_text(raw.get("one_line"), 300)),
+        summary=summary,
+        style=style,
+        sections=sections,
+        key_terms=key_terms,
+        diagrams=diagrams,
+        tables=tables,
+        checks=checks,
+        study_plan=study_plan,
+        citations=cited,
+        warnings=warnings,
+        dropped=resolve.dropped,
+    )
+
+
+def _extractive_sections(
+    part: dict[str, Any], passages: list[uploads.Section]
+) -> list[dict[str, Any]]:
+    """Last resort when a part cannot be summarised at all: its own opening.
+
+    Quoting the source is a failure of the copy rule, but dropping a lecture is a
+    failure of the coverage rule, and coverage matters more: the student can see
+    the passage is quoted, they cannot see the material that is missing.
+    """
+    if not passages:
+        return []
+    text = " ".join(passage.text for passage in passages)
+    opening = " ".join(synthesis.sentences(text)[:3])[:700]
+    if not opening:
+        return []
+    return [{"heading": part.get("label") or "Part", "body": opening, "source": passages[0].source}]
+
+
 # --------------------------------------------------------------------------- #
 # Generation
 # --------------------------------------------------------------------------- #
-def build_prompt(
+def _fit_passages(passages: list[uploads.Section], budget_chars: int) -> list[uploads.Section]:
+    """Keep a part inside the model's comfortable reading window.
+
+    Parts are usually one lecture; a part that is really a whole book chapter still
+    has to fit. When it does not, the selection stays strided so the summary is of
+    the part and not only of its first pages.
+    """
+    if not passages:
+        return []
+    total = sum(len(passage.text) for passage in passages)
+    if total <= budget_chars:
+        return list(passages)
+    room = max(1, budget_chars // PASSAGE_CHARS)
+    if room >= len(passages):
+        return list(passages)
+    step = (len(passages) - 1) / max(1, room - 1)
+    indices = sorted({min(len(passages) - 1, round(index * step)) for index in range(room)})
+    return [passages[index] for index in indices]
+
+
+def _part_passages(
+    document: uploads.Document, part: dict[str, Any], budget_chars: int = PART_BUDGET_CHARS
+) -> list[uploads.Section]:
+    sources = set(part.get("sources") or [])
+    picked = [section for section in document.sections if section.source in sources]
+    return _fit_passages(picked, budget_chars)
+
+
+# --------------------------------------------------------------------------- #
+# Prompts
+# --------------------------------------------------------------------------- #
+def _style_header(document: uploads.Document, profile: Profile, style: str) -> str:
+    return (
+        f"DOCUMENT: {document.title}\n"
+        f"FILES: {', '.join(document.files) or 'pasted text'}\n"
+        f"LEARNER PROFILE: dominant {label(style)} "
+        f"(scores: {', '.join(f'{key}={value:.2f}' for key, value in profile.ranked())})\n"
+    )
+
+
+def build_part_prompt(
     document: uploads.Document,
     profile: Profile,
     style: str,
+    part: dict[str, Any],
     passages: list[uploads.Section],
     tasks: dict[str, str],
 ) -> tuple[str, str]:
+    """One call per part of the material: this is what makes coverage real."""
     style = style.upper()
     shared = tasks.get("SHARED_RULES", "")
-    specific = tasks.get(f"REPORT_{style}", tasks.get("SHARED_RULES", ""))
-    schema = tasks.get("SCHEMA", "")
-
+    specific = tasks.get(f"REPORT_{style}", "")
+    schema = tasks.get("PART_SCHEMA", "")
     outline = "\n".join(f"- {heading}" for heading in document.outline()[:60])
-    coverage = part_coverage(document)
-    if coverage:
-        parts_block = "\n".join(
-            f"{index}. {part['label']}\n   sources: "
-            + "; ".join(part["sources"][:6])
-            + (" …" if len(part["sources"]) > 6 else "")
-            for index, part in enumerate(coverage, start=1)
-        )
-        section_target = len(coverage)
-    else:
-        parts_block = f"1. {document.title}\n   sources: (see passages)"
-        section_target = 3
+
     system = (
-        "You are a study-report writer. You summarise material the student uploaded. "
+        "You are a study-report writer working through a document one part at a time. "
         "You never copy source sentences verbatim, you never invent facts, and every "
         "claim you make carries the exact source string of the passage it came from. "
-        "Reply with a single JSON object and nothing else.\n\n"
-        f"{shared}"
+        "Reply with a single JSON object and nothing else.\n\n" + shared
     )
     user = (
-        f"DOCUMENT TITLE: {document.title}\n"
-        f"FILES: {', '.join(document.files) or 'pasted text'}\n"
-        f"LEARNER PROFILE: dominant {label(style)} "
-        f"(scores: {', '.join(f'{k}={v:.2f}' for k, v in profile.ranked())})\n\n"
-        f"THE MATERIAL HAS THESE PARTS — the report must contain at least one section drawing on "
-        f"each, not just the first:\n{parts_block}\n\n"
-        f"FULL OUTLINE OF THE DOCUMENT (for structure only — do not invent sources):\n{outline}\n\n"
-        f"SELECTED PASSAGES:\n{_passage_block(passages)}\n\n"
+        f"{_style_header(document, profile, style)}"
+        f"\nYOU ARE SUMMARISING ONE PART: {part['label']}\n"
+        "The document's other parts are summarised in separate calls. Do not write "
+        "their content and do not write an overall introduction — that is done later "
+        "by a separate step.\n\n"
+        f"WHOLE-DOCUMENT OUTLINE (context only, do not summarise it here):\n{outline}\n\n"
+        f"THIS PART'S PASSAGES:\n{_passage_block(passages)}\n\n"
         f"STYLE REQUIREMENTS:\n{specific}\n\n"
+        "Only the parts of those style requirements that concern `sections` and "
+        "`key_terms` apply here; another step writes the summary, diagrams and tables.\n\n"
         f"OUTPUT SCHEMA:\n{schema}\n\n"
-        f"DELIVERABLE CHECKLIST:\n"
-        f"- `sections`: {section_target} entries — one per part listed above, in the material's order. "
-        "Each section's `source` must be copied exactly from a `sources:` line belonging to that part.\n"
-        f"- `summary`: {120 if style != 'R' else 140}–{220 if style != 'R' else 190} words that name "
-        "the parts and say how they connect. A reader must be able to tell this is about the whole "
-        "document.\n"
-        "- `title`: names the actual subject of this material, not \"Study Report\" or \"Report on X\".\n"
-        "- `one_line`: what the learner can do after reading; not a restatement of the title.\n\n"
-        "Remember: synthesise. Do not reuse the passages' sentences. Reply with one JSON object and "
-        "nothing else — no preamble, no markdown fences."
+        "TASK:\n"
+        "- 2–4 `sections`, one per major idea or heading in this part, in the part's order. "
+        "A part that genuinely holds one idea returns one section rather than padding.\n"
+        "- Each body: 90–160 words of your own prose. Explain the idea, what it is for, "
+        "and how it connects to the next one. Never reuse a source sentence, and never "
+        "keep four consecutive words from the passage: rewording a quote with contractions "
+        "is still copying.\n"
+        "- Each `source`: copied exactly from a `[source: ...]` line above.\n"
+        "- 0–3 `key_terms` a student would be examined on, each with a short meaning and "
+        "an exact `source`.\n"
+        "- Cover everything important in this part. This is the only time it is read.\n"
     )
     return system, user
+
+
+def build_compose_prompt(
+    document: uploads.Document,
+    profile: Profile,
+    style: str,
+    sections: list[dict[str, Any]],
+    tasks: dict[str, str],
+) -> tuple[str, str]:
+    """One call over the part summaries: only the cross-document pieces."""
+    style = style.upper()
+    shared = tasks.get("SHARED_RULES", "")
+    specific = tasks.get(f"REPORT_{style}", "")
+    schema = tasks.get("COMPOSE_SCHEMA", "")
+    notes = "\n\n".join(
+        f"### {section['heading']}  [source: {section['source']}]\n{section['body']}"
+        for section in sections
+    )
+    system = (
+        "You are a study-report writer finishing a report whose sections are already "
+        "written. You never invent facts, you never copy source sentences verbatim. "
+        "Reply with a single JSON object and nothing else.\n\n" + shared
+    )
+    user = (
+        f"{_style_header(document, profile, style)}"
+        f"\nThe material has {len(sections)} written sections, listed below. They are "
+        "printed after your overview; you are writing what goes around them.\n\n"
+        f"SECTIONS ALREADY WRITTEN:\n{notes}\n\n"
+        f"STYLE REQUIREMENTS:\n{specific}\n\n"
+        f"OUTPUT SCHEMA:\n{schema}\n\n"
+        "TASK:\n"
+        f"- `summary`: {SUMMARY_MIN_WORDS}–{SUMMARY_MAX_WORDS} words; below "
+        f"{SUMMARY_MIN_WORDS} it is rejected. Write one short paragraph per part of the material, "
+        "then a closing sentence that says how they connect. This is the reader's map of the "
+        "whole thing; write it fresh — do not paste or paraphrase the sections above.\n"
+        "- `title` and `one_line`: name the subject, not the document type.\n"
+        "- `diagrams`, `tables`, `checks`, `study_plan`, `key_terms`: as the style "
+        "requirements ask. Use the sections above as your only source of facts.\n"
+        "- Do not return `sections`: they already exist and would only be duplicated.\n"
+    )
+    return system, user
+
+
+# --------------------------------------------------------------------------- #
+# The two passes
+# --------------------------------------------------------------------------- #
+def _summarise_part(
+    *,
+    llm: Any,
+    document: uploads.Document,
+    profile: Profile,
+    style: str,
+    part: dict[str, Any],
+    passages: list[uploads.Section],
+    tasks: dict[str, str],
+    attempts: int = 2,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int, str | None]:
+    """Summarise one part, retrying once if the reply is unusable or threadbare."""
+    system, user = build_part_prompt(document, profile, style, part, passages, tasks)
+    feedback = ""
+    tokens = 0
+
+    for attempt in range(1, attempts + 1):
+        prompt = f"{user}\n\n{feedback}".strip() if feedback else user
+        reply = llm.chat(
+            [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+            max_tokens=PART_MAX_TOKENS,
+            json_mode=True,
+        )
+        tokens += getattr(getattr(reply, "usage", None), "total", 0) or 0
+        try:
+            raw = extract_json(reply.text)
+            part_report = _normalise(raw, style=style, passages=passages)
+        except (LLMError, ValueError, KeyError, TypeError) as exc:
+            feedback = _error_feedback(exc)
+            continue
+
+        thin = [section["heading"] for section in part_report.sections if len(section["body"].split()) < 35]
+        if thin and attempt < attempts:
+            feedback = (
+                "These sections are too thin: "
+                + "; ".join(thin[:3])
+                + ". Write 90–160 words of explanation for each, in your own words, "
+                "with the mechanism or reason included."
+            )
+            continue
+
+        note = (
+            f"Part '{part['label']}' came back shorter than asked; it is included but thin."
+            if thin
+            else None
+        )
+        return part_report.sections[:4], part_report.key_terms, tokens, note
+
+    return (
+        _extractive_sections(part, passages),
+        [],
+        tokens,
+        f"Part '{part['label']}' could not be summarised, so its opening lines are quoted instead.",
+    )
 
 
 def generate(
@@ -550,16 +881,22 @@ def generate(
     *,
     llm: Any,
     prompts_dir: Any = None,
-    budget_chars: int = DEFAULT_BUDGET_CHARS,
+    budget_chars: int = PART_BUDGET_CHARS,
     max_attempts: int = 2,
     on_event: Callable[[str, dict[str, Any]], None] | None = None,
+    parts_limit: int = MAX_PARTS,
 ) -> Report:
-    """Generate the report: check the draft in code, retry once, then ship.
+    """Summarise the material part by part, then compose the whole.
 
-    The checks are the same on both attempts. A draft that fails the second time
-    is returned anyway, with each failure written into ``report.warnings`` so the
-    page can say what it is holding — an imperfect report that admits it beats an
-    error page on the night before an exam.
+    Two passes, and the first one is the important one. A single call over
+    selected passages lets a weak model summarise the opening and stop; one call
+    per part means every lecture is read by construction, and the model only has
+    to get one lecture's worth of detail right at a time.
+
+    The composing pass gets the part summaries (already compressed) and adds what
+    needs the whole document in view: title, overview, diagrams, tables, checks.
+    Its retry uses the same copy and quality gates as before, and the better of
+    its drafts ships with whatever is still wrong named on the page.
     """
     from pathlib import Path
 
@@ -567,22 +904,72 @@ def generate(
     prompts_dir = Path(prompts_dir) if prompts_dir else Path(__file__).resolve().parent.parent / "prompts"
     tasks = load_task_prompts(prompts_dir / "report.md")
 
-    passages = select_passages(document, budget_chars=budget_chars)
-    if not passages:
+    coverage = part_coverage(document, limit=parts_limit)
+    if not coverage:
+        coverage = [
+            {
+                "label": document.title,
+                "sources": _unique(section.source for section in document.sections),
+            }
+        ]
+
+    sections: list[dict[str, Any]] = []
+    terms: list[dict[str, Any]] = []
+    passages_all: list[uploads.Section] = []
+    part_notes: list[str] = []
+    tokens = 0
+
+    for index, part in enumerate(coverage, start=1):
+        passages = _part_passages(document, part, budget_chars)
+        if not passages:
+            continue
+        passages_all.extend(passages)
+        if on_event:
+            on_event(
+                "part.start",
+                {"part": part["label"], "index": index, "total": len(coverage)},
+            )
+        try:
+            part_sections, part_terms, used, note = _summarise_part(
+                llm=llm,
+                document=document,
+                profile=profile,
+                style=style,
+                part=part,
+                passages=passages,
+                tasks=tasks,
+            )
+        except LLMError as exc:
+            raise LLMError(f"Could not summarise '{part['label']}': {exc}") from exc
+        tokens += used
+        sections.extend(part_sections)
+        terms.extend(part_terms)
+        if note:
+            part_notes.append(note)
+        if on_event:
+            on_event(
+                "part.done",
+                {
+                    "part": part["label"],
+                    "index": index,
+                    "total": len(coverage),
+                    "sections": len(part_sections),
+                },
+            )
+
+    if not sections:
         raise ValueError("No text to summarise. The upload produced no usable sections.")
 
     source_text = "\n\n".join(section.text for section in document.sections)
-    coverage = part_coverage(document)
-    system, user = build_prompt(document, profile, style, passages, tasks)
+    system, user = build_compose_prompt(document, profile, style, sections, tasks)
 
-    tokens = 0
     report: Report | None = None
     feedback = ""
     process_notes: list[str] = []
     best: tuple[tuple[int, int, float], Report, Any, list[str], int] | None = None
 
     def finish(final: Report) -> Report:
-        final.notes = process_notes + final.notes
+        final.notes = process_notes + part_notes + final.notes
         final.tokens = tokens
         return _finalise(final, document, style)
 
@@ -592,7 +979,7 @@ def generate(
         try:
             reply = llm.chat(
                 [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
-                max_tokens=REPORT_MAX_TOKENS,
+                max_tokens=COMPOSE_MAX_TOKENS,
                 json_mode=True,
             )
         except LLMError as exc:
@@ -601,8 +988,10 @@ def generate(
         tokens += getattr(getattr(reply, "usage", None), "total", 0) or 0
 
         try:
-            parsed = extract_json(reply.text)
-            report = _normalise(parsed, style=style, passages=passages)
+            raw = extract_json(reply.text)
+            report = _assemble(
+                raw, style=style, sections=sections, terms=terms, passages=passages_all
+            )
         except (LLMError, ValueError, KeyError, TypeError) as exc:
             report = None
             feedback = _error_feedback(exc)

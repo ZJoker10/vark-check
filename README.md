@@ -84,6 +84,11 @@ no web framework.
 3. **Choose a shape** — the same material becomes four genuinely different
    documents. Not the same text with a different accent colour: the block order,
    the prose register, the units and what is present all change.
+4. **Read the whole thing** — a 200–480-word overview of how the parts fit
+   together, then a written section for **every** part of the upload (one model
+   call per part, so no lecture is skipped), then the diagrams, terms, tables,
+   self-checks and study plan your shape calls for. Download as PDF, DOCX or
+   Markdown.
 
 | | Visual | Aural | Read / write | Kinesthetic |
 |---|---|---|---|---|
@@ -92,24 +97,50 @@ no web framework.
 | Tables | yes | no | yes | no |
 | Prose register | captions and labels | "say it out loud" narration | dense, formal, numbered | imperative, one action per step |
 
-The shape is enforced in code, not requested in the prompt — `_normalise()`
+The shape is enforced in code, not requested in the prompt — `_assemble()`
 strips diagrams from an aural report even when the model sends them, because a
 report with a flowchart in it is not an aural report.
 
+### How the report is built: one part at a time
+
+A single "here are some passages, summarise them" call is why early v2 drafts
+summarised the introduction and stopped. The fix is structural: the material is
+split into **parts** (a lecture, a chapter, a top-level heading, with its
+sources), and the model is called **once per part**.
+
+```
+map      for each part:  passages ──▶ sections + key terms
+reduce   once:           all sections ──▶ title, 200–480-word overview,
+                                          diagrams, tables, self-checks, plan
+```
+
+Coverage is then a property of the pipeline rather than a hope: a part that was
+never read cannot be summarised, and the composing pass is handed every part's
+sections, so the overview has to talk about all of them. A part that comes back
+threadbare is retried on its own (with its thin section names quoted at it), and
+a part that cannot be summarised at all is included as a **quoted opening** —
+copying one lecture is a smaller failure than dropping it. The page counts
+elapsed seconds while it works, because a three-lecture upload is a few minutes
+on a local model and a spinner that never changes reads like a hang.
+
+Only the composing pass is subject to the copy and quality gates below; the
+sections themselves were written from one part's passages, where the per-part
+prompt already asks for 90–160 words of explanation per idea.
+
 ### What makes it a summary and not an excerpt
 
-This is the part worth reading. Four checks run on every draft, and any of them
-can send it back to the model once:
+This is the part worth reading. Four checks run on the composed draft, and any
+of them can send it back to the model once:
 
 | Guardrail | Rule | Where |
 |---|---|---|
 | **Synthesis** | 6-word shingle containment against the source. A sentence is "copied" at ≥ 0.55 similarity; a draft over 30 % copied is rejected. | `varkcheck/synthesis.py` |
-| **Coverage** | The document is grouped into parts with their own sources; the report must cite each part. Missing parts are named in the retry prompt. | `summarize.part_coverage` / `_missing_parts` |
-| **Shape** | Summary must be 90–420 words, must not describe itself ("This report covers…"), and a visual report must contain a usable diagram. | `summarize._quality_issues` |
-| **Grounding** | Every `source: file §section` is resolved against the passages actually sent. An invented citation is replaced with the best real match, or the item is dropped. | `summarize._normalise` |
+| **Coverage** | Every part gets its own model call, and its sections are carried into the report unchanged. The overview must cite each part; missing ones are named in the retry prompt. | `summarize.part_coverage` / `_missing_parts` |
+| **Shape** | Overview must be 200–480 words, must not describe itself ("This report covers…"), and a visual report must contain a usable diagram. | `summarize._quality_issues` |
+| **Grounding** | Every `source: file §section` is resolved against the passages actually sent. An invented citation is replaced with the best real match, or the item is dropped. | `summarize._normalise` / `_Resolver` |
 
 If the second draft still falls short, the report ships **with the failure stated
-on the page** — "the summary is 60 words", "nothing in the report comes from
+on the page** — "the summary is 148 words", "nothing in the report comes from
 Lecture 1" — rather than silently pretending. The better of the two drafts is
 the one kept: a genuine summary with one flaw beats a rewrite that copies its
 source, and among drafts that both copy, the one that copies less wins. When a
@@ -141,12 +172,12 @@ and nothing is claimed about its contents. The UI says this in as many words.
 
 ### What v2 does not do
 
-- **Small local models struggle.** `llama3.1` (8B) frequently produces 60-word
-  summaries that describe the report instead of the material, and covers one
-  lecture out of three even after a retry. `gemma4:12b` obeys the schema and the
-  coverage rule reliably at ~25 s per call. The guardrails surface the difference
-  honestly instead of hiding it; a frontier model is the obvious setting for
-  marking, and `--provider deepseek` is one flag away.
+- **Small local models still need the structure.** `llama3.1` (8B) does not
+  write a good overview on its own; the per-part pass is what keeps it from
+  dropping a lecture, and it is why a three-lecture upload now produces sections
+  for all three. `gemma4:12b` obeys the schema better and is much slower (~25 s
+  per call, i.e. a few minutes per report). The guardrails surface the difference
+  honestly instead of hiding it; `--provider deepseek` is one flag away.
 - **No OCR.** A scanned PDF yields a warning, not a report.
 - **No recognition.** Nothing learns across sessions; two uploads of the same
   file are two unrelated documents.
@@ -160,11 +191,11 @@ varkcheck/web/          server.py, __main__.py, static/{index.html,app.js,style.
 varkcheck/uploads.py    PDF/DOCX/MD/TXT/image extraction -> Document/Section/Figure
 varkcheck/profile.py    Profile, score(), describe(), localStorage serialisation
 varkcheck/synthesis.py  the copy detector and its retry instruction
-varkcheck/summarize.py  passage selection, coverage, quality gate, retry loop
+varkcheck/summarize.py  part coverage, per-part map calls, composing pass, gates
 varkcheck/render.py     HTML / PDF / DOCX / Markdown, prompt-injection sanitiser
 varkcheck/templates/    report.html — one template, four styles
-prompts/report.md       SHARED_RULES + REPORT_V/A/R/K + schema (version 2.0.0)
-tests/test_v2.py        54 tests: extraction, coverage, profiling, copy check, renderers
+prompts/report.md       SHARED_RULES + REPORT_V/A/R/K + PART/COMPOSE schemas (3.0.1)
+tests/test_v2.py        62 tests: extraction, coverage, profiling, copy check, two-pass loop, renderers
 ```
 
 v1 is untouched: `app.py` and its 86 tests still run exactly as before.
@@ -399,7 +430,7 @@ either produces the same "I've flagged this for your lecturer" path.
 pytest -q                      # or: python -m unittest discover -s tests
 ```
 
-**140 tests, ~15 seconds, no network, no API key.** They run against the real
+**148 tests, ~15 seconds, no network, no API key.** They run against the real
 course material in `data/course/`, so they fail if the demo material stops being
 indexable.
 
@@ -412,7 +443,7 @@ indexable.
 | `test_tools.py` | every tool, including cache hits, hidden keys, empty answers costing no tokens, leak replacement, bad arguments |
 | `test_agent.py` | the loop, step/token budgets, protocol failures, provider failure, both fallbacks, profile written even if the model forgets |
 | `test_scenarios.py` | replay of the five documented interactions, including the two boundary cases |
-| `test_v2.py` | upload extraction (order, bad files, image figures, caps), part coverage and sampling, profile clamping, the copy detector, blank-reply recovery, and each renderer — including that a PDF has no escaped HTML and that all four styles differ |
+| `test_v2.py` | upload extraction (order, bad files, image figures, caps), part coverage and sampling, profile clamping, the copy detector, blank-reply recovery, the per-part map and composing passes (a bad part is still covered; the better draft wins), Mermaid validation, and each renderer — including that a PDF has no escaped HTML and that all four styles differ |
 
 ---
 
@@ -424,7 +455,7 @@ vark-check/
 ├── prompts/
 │   ├── system.md              ROLE · GOAL · RULES · PROCEDURE · OUTPUT FORMAT (versioned)
 │   ├── tasks.md               per-tool instructions (versioned)
-│   └── report.md              v2: SHARED_RULES + per-style report briefs + schema
+│   └── report.md              v2: SHARED_RULES + style briefs + PART/COMPOSE schemas
 ├── varkcheck/
 │   ├── agent.py               plan → act → observe loop, budgets, hand-over, fallbacks
 │   ├── tools.py               the seven tools + registry + observation caps
@@ -442,7 +473,7 @@ vark-check/
 │   ├── uploads.py             v2: PDF/DOCX/MD/TXT/image → Document/Section/Figure
 │   ├── profile.py             v2: scoring, describe(), localStorage round-trip
 │   ├── synthesis.py           v2: the copy detector and its retry instruction
-│   ├── summarize.py           v2: passages, coverage, quality gate, retry loop
+│   ├── summarize.py           v2: part map/reduce, quality gate, retry loop
 │   ├── render.py              v2: HTML/PDF/DOCX/Markdown + sanitiser
 │   ├── templates/report.html  v2: one template, four styles
 │   └── web/                   v2: server.py, __main__.py, static/
@@ -451,7 +482,7 @@ vark-check/
 │   ├── ingest.py              build/rebuild the index
 │   ├── seed_demo.py           refresh the synthetic cohort, print the digest
 │   └── demo_flow.py           end-to-end walkthrough, no API key
-├── tests/                     140 tests (86 v1 + 54 v2)
+├── tests/                     148 tests (86 v1 + 62 v2)
 └── docs/
     ├── architecture.md
     └── example_interactions.md

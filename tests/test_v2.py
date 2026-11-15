@@ -45,23 +45,6 @@ def visual_profile() -> profile_mod.Profile:
     return profile_mod.score(responses)
 
 
-class ScriptedLLM:
-    """A model with a fixed script: one reply per call, in order."""
-
-    def __init__(self, script: list[dict]) -> None:
-        self.script = list(script)
-        self.calls = 0
-
-    def chat(self, messages, **kwargs):
-        import json
-
-        from varkcheck.llm import LLMReply, Usage
-
-        self.calls += 1
-        item = self.script.pop(0)
-        return LLMReply(text=json.dumps(item), usage=Usage(10, 10), model="scripted")
-
-
 class TempDirTest(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="vark-v2-")
@@ -333,6 +316,7 @@ class RenderTests(TempDirTest):
         text = "".join(page.extract_text() or "" for page in PdfReader(str(target)).pages)
         self.assertIn("Regression and Learning", text)
         self.assertIn("The loop", text)
+        self.assertIn("A short synthesis of the uploaded material", text)
         self.assertNotIn("<h2>", text, "HTML must be rendered, not escaped")
 
     def test_pdf_embeds_the_diagram_as_vector(self) -> None:
@@ -368,8 +352,34 @@ class RenderTests(TempDirTest):
 
     def test_markdown_export_is_complete(self) -> None:
         text = render.to_markdown(sample_report(), visual_profile())
-        for expected in ("# Regression", "## Summary", "```mermaid", "## Terms to know", "## Sources"):
+        for expected in (
+            "# Regression",
+            "## The whole picture",
+            "```mermaid",
+            "## Terms to know",
+            "## Sources",
+        ):
             self.assertIn(expected, text)
+
+    def test_the_overview_is_printed_and_comes_before_the_sections(self) -> None:
+        """The overview is the point of the report; it must not be merely styled."""
+        report = sample_report()
+        report.summary = (
+            "The three lectures build one idea: predict, measure the error, correct the parameters."
+        )
+        html = render.to_html(report, visual_profile(), preview=True)
+        self.assertIn("The three lectures build one idea", html)
+        self.assertLess(
+            html.index("The three lectures build one idea"),
+            html.index("Another claim"),
+            "the overview belongs above the sections it introduces",
+        )
+        self.assertIn("The three lectures build one idea", render.to_markdown(report, visual_profile()))
+
+    def test_read_write_calls_the_overview_an_abstract(self) -> None:
+        text = render.to_markdown(sample_report("R"), visual_profile())
+        self.assertIn("## Abstract", text)
+        self.assertNotIn("The whole picture", text)
 
     def test_html_export_is_sanitised(self) -> None:
         report = sample_report()
@@ -506,6 +516,28 @@ class MetadataTests(TempDirTest):
         self.assertEqual(report.citations, [real_source])
         self.assertEqual(report.sections[0]["source"], real_source)
 
+    def test_a_meta_opening_is_deleted_not_retried(self) -> None:
+        """ "This report covers X" spends a retry to fix three words; delete them instead."""
+        document = uploads.extract([("photosynthesis.md", MARKDOWN.encode())], self.tmp)
+        passages = summarize.select_passages(document)
+        raw = {
+            "title": "Plants and Light",
+            "one_line": "This report covers photosynthesis in two stages.",
+            "summary": "This summary explains that light drives sugar production. " * 4,
+            "sections": [],
+            "key_terms": [],
+            "diagrams": [],
+            "tables": [],
+            "checks": [],
+            "study_plan": [],
+        }
+        report = summarize._assemble(
+            raw, style="V", sections=[], terms=[], passages=passages
+        )
+        self.assertEqual(report.one_line, "Photosynthesis in two stages.")
+        self.assertTrue(report.summary.startswith("That light drives sugar production."))
+        self.assertFalse(summarize._META.match(report.summary))
+
     def test_invented_citation_is_replaced_by_a_real_one(self) -> None:
         document = uploads.extract([("photosynthesis.md", MARKDOWN.encode())], self.tmp)
         passages = summarize.select_passages(document)
@@ -567,6 +599,54 @@ class MetadataTests(TempDirTest):
             )
         )
 
+    def test_a_node_id_with_a_space_is_rejected(self) -> None:
+        """`Learning Rate[Learning Rate]` aborts the render: Mermaid wants one id token."""
+        broken = (
+            "graph LR\n"
+            "  Parameters[Parameters]\n"
+            "  Learning Rate[Learning Rate]\n"
+            "  Parameters -->|Update| Learning Rate"
+        )
+        self.assertTrue(summarize._has_spaced_node_id(broken))
+        self.assertFalse(summarize._valid_mermaid(broken))
+        fixed = (
+            "graph LR\n"
+            "  P[Parameters] -->|Update| LR[Learning rate]\n"
+            "  LR -->|Multiply| D[Derivative]"
+        )
+        self.assertFalse(summarize._has_spaced_node_id(fixed))
+        self.assertTrue(summarize._valid_mermaid(fixed))
+
+    def test_a_short_document_is_not_asked_for_a_long_overview(self) -> None:
+        """A one-page handout cannot support a 200-word map of itself."""
+        body = "# Note\n\n" + ("This note explains one idea. " * 25)
+        document = uploads.extract([("note.md", body.encode())], self.tmp)
+        report = summarize.Report(
+            title="t",
+            one_line="One idea.",
+            summary="word " * 150,
+            style="A",
+            sections=[],
+            citations=[],
+        )
+        issues = summarize._quality_issues(report, document, "A", [])
+        self.assertFalse(any("too short" in issue for issue in issues), issues)
+
+    def test_meta_prose_in_the_one_line_is_caught(self) -> None:
+        document = uploads.extract(course_files(), self.tmp)
+        coverage = summarize.part_coverage(document)
+        report = summarize.Report(
+            title="t",
+            one_line="This report covers supervised learning.",
+            summary="A real summary of the material. " * 40,
+            style="V",
+            sections=[],
+            citations=[],
+            diagrams=[{"title": "d", "caption": "", "mermaid": "flowchart TD\n A[One] --> B[Two]\n B --> C[Three]"}],
+        )
+        issues = summarize._quality_issues(report, document, "V", coverage)
+        self.assertTrue(any("one_line" in issue for issue in issues))
+
     def test_aural_report_drops_diagrams_even_if_the_model_sends_them(self) -> None:
         document = uploads.extract([("photosynthesis.md", MARKDOWN.encode())], self.tmp)
         passages = summarize.select_passages(document)
@@ -623,117 +703,166 @@ class MetadataTests(TempDirTest):
         self.assertIn("nothing in the report comes from", joined.lower())
 
 
+class TwoStageLLM:
+    """A model that answers the per-part pass itself and scripts the composing pass.
+
+    The part pass is not what these tests are about, so it is derived from the
+    prompt: one section per part, in the model's own words, citing the first
+    `[source: ...]` it was given. `part_failures` makes the first N part calls
+    return rubbish, which is how the extractive fallback gets exercised.
+    """
+
+    def __init__(self, compose: list[dict], *, part_failures: int = 0) -> None:
+        self.compose = list(compose)
+        self.part_failures = part_failures
+        self.calls = 0
+        self.part_calls = 0
+        self.compose_calls = 0
+
+    def chat(self, messages, **kwargs):
+        import json
+        import re as _re
+
+        from varkcheck.llm import LLMReply, Usage
+
+        self.calls += 1
+        user = messages[-1]["content"]
+
+        if "YOU ARE SUMMARISING ONE PART" in user:
+            self.part_calls += 1
+            if self.part_failures:
+                self.part_failures -= 1
+                return LLMReply(text="not json at all", usage=Usage(5, 5), model="scripted")
+            label = user.split("YOU ARE SUMMARISING ONE PART:")[1].splitlines()[0].strip()
+            sources = _re.findall(r"\[source: ([^\]]+)\]", user)
+            body = (
+                f"{label} is explained here in our own words, with the mechanism and the "
+                "reason it matters, so a reader can follow the argument without seeing the "
+                "original sentences. The part also shows how the idea is used in practice "
+                "and what changes when it is applied."
+            )
+            return LLMReply(
+                text=json.dumps(
+                    {
+                        "sections": [
+                            {"heading": label, "body": body, "source": sources[0] if sources else ""}
+                        ],
+                        "key_terms": [],
+                    }
+                ),
+                usage=Usage(10, 10),
+                model="scripted",
+            )
+
+        self.compose_calls += 1
+        return LLMReply(text=json.dumps(self.compose.pop(0)), usage=Usage(10, 10), model="scripted")
+
+
+FLOW = "flowchart LR\n  A[Light] --> B[Split water]\n  B --> C[Fix carbon]"
+
+
+def long_summary() -> str:
+    """Our own words, comfortably over the 200-word floor."""
+    return (
+        "Photosynthesis turns light into stored chemical energy in two connected stages. "
+        "The first stage captures photons and uses that energy to split water, releasing "
+        "oxygen as a by-product; the second uses the captured energy to fix carbon dioxide "
+        "into sugar, so sunlight ends up as fuel the plant can spend later. Read them as "
+        "one chain rather than two topics: capture supplies the energy, and the cycle "
+        "spends it. "
+    ) * 4
+
+
+def compose_draft(title: str, summary: str, *, diagram: bool = True) -> dict:
+    return {
+        "title": title,
+        "one_line": "What the reader should be able to do afterwards.",
+        "summary": summary,
+        "key_terms": [],
+        "diagrams": [{"title": "Capture then build", "caption": "", "mermaid": FLOW}] if diagram else [],
+        "tables": [],
+        "checks": [],
+        "study_plan": ["Draw the two stages from memory"],
+    }
+
+
 # --------------------------------------------------------------------------- #
 class GenerationLoopTests(TempDirTest):
     def test_a_copying_draft_is_rewritten(self) -> None:
         document = uploads.extract([("photosynthesis.md", MARKDOWN.encode())], self.tmp)
-        passages = summarize.select_passages(document)
-        source_sentences = synthesis.sentences(" ".join(passage.text for passage in document.sections))
+        source_sentences = synthesis.sentences(
+            " ".join(section.text for section in document.sections)
+        )
 
-        copied = {
-            "title": "Copied",
-            "one_line": "o",
-            "summary": " ".join(source_sentences)[:1200],
-            "sections": [
-                {"heading": "A", "body": " ".join(source_sentences)[:400], "source": passages[0].source},
-                {"heading": "B", "body": " ".join(source_sentences)[:400], "source": passages[-1].source},
-            ],
-            "key_terms": [],
-            "diagrams": [],
-            "tables": [],
-            "checks": [],
-            "study_plan": [],
-        }
-        honest = {
-            "title": "Plants and Light",
-            "one_line": "How leaves store sunlight as sugar.",
-            "summary": (
-                "Leaves capture photons with chlorophyll and use that energy to split water, "
-                "releasing oxygen as a side product. The captured energy then drives a cycle that "
-                "fixes carbon dioxide into sugar, so light becomes stored chemical fuel. Together "
-                "the two stages form one chain: capture, then build. "
-            )
-            * 3,
-            "sections": [
-                {"heading": "Capture", "body": "Pigments absorb light and split water.", "source": passages[0].source},
-                {"heading": "Build", "body": "The stored energy fixes carbon into sugar.", "source": passages[-1].source},
-            ],
-            "key_terms": [{"term": "Thylakoid", "meaning": "The membrane where light is caught.", "source": passages[0].source}],
-            "diagrams": [{"title": "Capture then build", "caption": "", "mermaid": "flowchart LR\n A[Light] --> B[Split water]\n B --> C[Fix carbon]"}],
-            "tables": [],
-            "checks": [],
-            "study_plan": ["Draw the two stages"],
-        }
-
-        class Scripted:
-            def __init__(self, script):
-                self.script = list(script)
-                self.calls = 0
-
-            def chat(self, messages, **kwargs):
-                self.calls += 1
-                from varkcheck.llm import LLMReply, Usage
-
-                item = self.script.pop(0)
-                import json
-
-                return LLMReply(text=json.dumps(item), usage=Usage(10, 10), model="scripted")
-
-        llm = Scripted([copied, honest])
+        llm = TwoStageLLM(
+            [
+                compose_draft("Copied", " ".join(source_sentences)),
+                compose_draft("Plants and Light", long_summary()),
+            ]
+        )
         report = summarize.generate(document, visual_profile(), "V", llm=llm, max_attempts=2)
+
         self.assertEqual(report.attempts, 2)
         self.assertTrue(report.synthesis_ok)
+        self.assertLess(report.synthesis_ratio, synthesis.MAX_COPIED_RATIO)
         self.assertTrue(any("rewritten" in note for note in report.notes))
 
     def test_the_better_of_two_bad_drafts_is_kept(self) -> None:
         """A rewrite that copies must not displace a genuine but imperfect draft."""
         document = uploads.extract([("photosynthesis.md", MARKDOWN.encode())], self.tmp)
-        passages = summarize.select_passages(document)
-        source_sentences = synthesis.sentences(" ".join(passage.text for passage in document.sections))
+        source_sentences = synthesis.sentences(
+            " ".join(section.text for section in document.sections)
+        )
 
-        # Draft one: our own words, but too short to be a summary of the material.
-        thin = {
-            "title": "Plants and Light",
-            "one_line": "How leaves store sunlight as sugar.",
-            "summary": "Leaves turn light into sugar through two linked stages.",
-            "sections": [
-                {"heading": "Capture", "body": "Pigments absorb light and split water.", "source": passages[0].source},
-                {"heading": "Build", "body": "The stored energy fixes carbon into sugar.", "source": passages[-1].source},
-            ],
-            "key_terms": [],
-            "diagrams": [{"title": "Capture then build", "caption": "", "mermaid": "flowchart LR\n A[Light] --> B[Split water]\n B --> C[Fix carbon]"}],
-            "tables": [],
-            "checks": [],
-            "study_plan": [],
-        }
-        # Draft two: the retry, which simply pastes the source back.
-        copied = {
-            "title": "Copied",
-            "one_line": "o",
-            "summary": " ".join(source_sentences)[:1200],
-            "sections": [
-                {"heading": "A", "body": " ".join(source_sentences)[:400], "source": passages[0].source},
-                {"heading": "B", "body": " ".join(source_sentences)[:400], "source": passages[-1].source},
-            ],
-            "key_terms": [],
-            "diagrams": [],
-            "tables": [],
-            "checks": [],
-            "study_plan": [],
-        }
-
-        llm = ScriptedLLM([thin, copied])
+        llm = TwoStageLLM(
+            [
+                compose_draft("Plants and Light", "Leaves turn light into sugar in two stages."),
+                compose_draft("Copied", " ".join(source_sentences)),
+            ]
+        )
         report = summarize.generate(document, visual_profile(), "V", llm=llm, max_attempts=2)
 
-        self.assertEqual(llm.calls, 2)
+        self.assertEqual(llm.compose_calls, 2, "two drafts were written")
         self.assertEqual(report.title, "Plants and Light", "the honest draft should be the one shipped")
         self.assertTrue(report.synthesis_ok)
         self.assertLess(report.synthesis_ratio, synthesis.MAX_COPIED_RATIO)
-        self.assertEqual(report.attempts, 2, "two drafts were written")
+        self.assertEqual(report.attempts, 2)
         process = " ".join(report.notes)
         self.assertIn("earlier draft", process)
         self.assertNotIn("was rewritten", process, "a draft that was kept was not rewritten")
         self.assertTrue(any("still" in warning for warning in report.warnings))
+
+    def test_every_part_is_summarised_before_the_overview(self) -> None:
+        """The point of the map pass: the model cannot skip a lecture it never sees."""
+        document = uploads.extract(course_files(), self.tmp)
+        coverage = summarize.part_coverage(document)
+        self.assertGreaterEqual(len(coverage), 3)
+
+        llm = TwoStageLLM([compose_draft("Machine Learning Foundations", long_summary())])
+        report = summarize.generate(document, visual_profile(), "V", llm=llm, max_attempts=2)
+
+        self.assertEqual(llm.part_calls, len(coverage), "one model call per part")
+        self.assertEqual(report.coverage["covered"], report.coverage["parts"])
+        cited = {section["source"] for section in report.sections}
+        for part in coverage:
+            self.assertTrue(cited & set(part["sources"]), f"no section for {part['label']}")
+        # The composing pass is what turns the parts into one document.
+        self.assertEqual(llm.compose_calls, 1)
+        self.assertGreaterEqual(len(report.summary.split()), summarize.SUMMARY_MIN_WORDS)
+
+    def test_a_part_that_cannot_be_summarised_is_still_covered(self) -> None:
+        """Quoting one part beats dropping it: coverage is the promise."""
+        document = uploads.extract(course_files(), self.tmp)
+
+        llm = TwoStageLLM(
+            [compose_draft("Foundations", long_summary()), compose_draft("Foundations", long_summary())],
+            part_failures=2,
+        )
+        report = summarize.generate(document, visual_profile(), "V", llm=llm, max_attempts=2)
+
+        self.assertTrue(any("quoted instead" in note for note in report.notes))
+        self.assertEqual(report.coverage["covered"], report.coverage["parts"])
+        self.assertTrue(report.sections)
 
     def test_no_text_raises_a_clear_error(self) -> None:
         document = uploads.extract([("empty.md", b"")], self.tmp)

@@ -244,10 +244,18 @@ def _check_block(check: dict[str, Any]) -> str:
     return f'<div class="check"><div class="q">{_esc(check.get("question"))}</div>{hint}</div>'
 
 
+def overview_title(style: str) -> str:
+    """What the overview block is called. Read/write gets the formal word."""
+    return "Abstract" if style.upper() == "R" else "The whole picture"
+
+
 def build_blocks(report: Report, scholarly_h2: Any, svgs: dict[int, str], preview: bool = False) -> str:
     style = report.style.upper()
     order = BLOCK_ORDER.get(style, BLOCK_ORDER["V"])
     pieces: dict[str, str] = {}
+
+    if report.summary:
+        pieces["summary"] = report.summary
 
     diagram_index = 0
     if report.diagrams:
@@ -283,8 +291,8 @@ def build_blocks(report: Report, scholarly_h2: Any, svgs: dict[int, str], previe
         if name == "summary":
             number += 1
             body.append(
-                scholarly_h2(number, "Summary")
-                + f'<div class="summary">{to_markdown_html(report.summary)}</div>'
+                scholarly_h2(number, overview_title(style))
+                + f'<div class="summary">{to_markdown_html(pieces["summary"])}</div>'
             )
             continue
         titles = {
@@ -409,7 +417,7 @@ def to_docx(report: Report, profile: Profile, *, svgs: dict[int, str] | None = N
         warn_run.font.size = Pt(9)
         warn_run.font.color.rgb = RGBColor(0x8A, 0x5A, 0x00)
 
-    document.add_heading("Summary", level=1)
+    document.add_heading(overview_title(report.style), level=1)
     for paragraph in _plain(report.summary).split("\n\n"):
         if paragraph.strip():
             document.add_paragraph(paragraph.strip())
@@ -505,7 +513,7 @@ def to_markdown(report: Report, profile: Profile) -> str:
     if report.warnings:
         lines.extend(["> **Worth knowing:**", *[f"> - {w}" for w in report.warnings], ""])
 
-    lines.extend(["## Summary", "", report.summary, ""])
+    lines.extend([f"## {overview_title(report.style)}", "", report.summary, ""])
 
     if report.diagrams:
         lines.extend(["## Diagrams", ""])
